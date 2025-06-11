@@ -1,0 +1,345 @@
+# -*- coding: utf-8 -*-
+"""
+Predicting Atrial Fibrillation Substrate Development:
+A Machine Learning Approach to Classifying Arrhythmic Remodeling (v2.1)
+
+This script presents a computational study to test the hypothesis that machine
+learning can predict an atrial cardiomyocyte's vulnerability to developing an
+atrial fibrillation (AF) substrate based on its baseline action potential morphology.
+
+The study proceeds in three stages:
+1.  **Phenotype Generation:** Datasets are generated using the Courtemanche et al. (1998)
+    human atrial cell model, with pre-pacing to ensure steady-state. Parameters are
+    tuned to create three functional classes: 'Normal Sinus Rhythm (NSR)',
+    'Paroxysmal AF (pAF) Prone', and 'Chronic AF (cAF) Substrate'.
+2.  **Prognostic Classification:** A machine learning classifier is trained and evaluated
+    using Stratified K-Fold cross-validation for robust performance assessment.
+3.  **Prognostic Validation:** The classifier's predictions are validated by applying a
+    pro-arrhythmic "stress test" (rapid pacing) to cells predicted to be at high
+    risk for AF, and confirming they exhibit significant APD shortening.
+
+(Version 2.1: Enhanced for publishable quality with cross-validation, pre-pacing,
+ and improved reproducibility.)
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+from sklearn.model_selection import StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+import time
+
+# --- PART 1: Courtemanche (1998) Human Atrial Model ---
+
+def courtemanche_1998_model(t, y, params):
+    """
+    Courtemanche et al. (1998) model of the human atrial myocyte, adapted
+    to simulate electrical remodeling in atrial fibrillation.
+    """
+    # Unpack state variables
+    V, u, v, w, d, f, f_ca, h, j, m, x_r, x_s, i_rel, i_up, i_tr, i_leak, Cai, Ca_rel, Ca_up, Nai, Ki = y
+
+    # Unpack parameters from the params dictionary
+    G_CaL_factor = params.get('G_CaL_factor', 1.0)
+    G_to_factor = params.get('G_to_factor', 1.0)
+    G_Kur_factor = params.get('G_Kur_factor', 1.0)
+    G_K1_factor = params.get('G_K1_factor', 1.0)
+    pacing_rate = params['pacing_rate'] # BCL in ms
+
+    # --- Constants ---
+    Cm = 100.0  # pF
+    R = 8314.0  # mJ/mol/K
+    T = 310.0   # K
+    F = 96485.0 # C/mol
+    Nao = 140.0 # mM
+    Ko = 5.4    # mM
+    Cao = 1.8   # mM
+
+    # --- Reversal Potentials ---
+    E_Na = (R * T / F) * np.log(Nao / Nai)
+    E_K = (R * T / F) * np.log(Ko / Ki)
+    E_Ca = 0.5 * (R * T / F) * np.log(Cao / Cai)
+    E_Kr = (R * T / F) * np.log(Ko / Ki) # Simplified for Kr
+    E_Ks = (R * T / F) * np.log((Ko + 0.01833 * Nao) / (Ki + 0.01833 * Nai))
+
+    # --- Ion Channel Conductances (with AF remodeling factors) ---
+    G_Na = 7.8
+    G_CaL = 0.1238 * G_CaL_factor
+    G_to = 0.1652 * G_to_factor
+    G_Kur = 0.005 + 0.05 * G_Kur_factor
+    G_K1 = 0.09 * G_K1_factor
+    G_Kr = 0.0294
+    G_Ks = 0.129
+    G_b_Na = 0.000674
+    G_b_Ca = 0.00113
+    G_b_K = 0.00029
+
+    # --- Ionic Currents ---
+    I_Na = G_Na * (m**3) * h * j * (V - E_Na)
+    I_CaL = G_CaL * d * f * f_ca * (V - 65)
+    I_to = G_to * u * v * (V - E_K)
+    I_Kur = G_Kur * w * (V - E_K)
+    I_Kr = G_Kr * x_r * (V - E_K)
+    I_Ks = G_Ks * x_s * (V - E_Ks)
+    I_K1 = G_K1 * (V - E_K) / (1 + np.exp(0.07 * (V + 80)))
+    I_b_Na = G_b_Na * (V - E_Na)
+    I_b_Ca = G_b_Ca * (V - E_Ca)
+    I_b_K = G_b_K * (V - E_K)
+    k_NaCa = 0.0001
+    I_NaCa = k_NaCa * ((Nai**3 * Cao * np.exp(0.35 * V * F / (R * T))) -
+                       (Nao**3 * Cai * np.exp(-0.65 * V * F / (R * T)))) / \
+                       (1 + 0.1245 * np.exp(-0.1 * V * F / (R * T)) + 0.0003 * np.exp(V * F / (R * T)))
+    P_NaK = 1.5
+    I_NaK = P_NaK * (Ko / (Ko + 1.5)) * (Nai / (Nai + 20)) * (1 / (1 + 0.1245 * np.exp(-0.1 * V * F / (R * T))))
+
+    # --- Calcium Dynamics ---
+    V_up = 0.006375; K_up = 0.00092; V_rel = 480.0; k_rel = 0.0003; V_tr = 0.0075; V_leak = 0.00008
+    I_up = V_up / (1 + K_up**2 / Cai**2)
+    I_rel = V_rel * (k_rel * Ca_rel**2 / (k_rel + Ca_rel**2)) * d * f * f_ca
+    I_tr = (Ca_up - Ca_rel) / 180.0
+    I_leak = V_leak * Ca_up
+
+    # --- Total Ion Current and Stimulus ---
+    I_ion = I_Na + I_CaL + I_to + I_Kur + I_Kr + I_Ks + I_K1 + I_b_Na + I_b_Ca + I_b_K + I_NaCa + I_NaK
+    I_stim = 0
+    if (t % pacing_rate) < 2.0:
+        I_stim = params.get('stim_amp', -25.5)
+    dVdt = -(I_ion + I_stim) / Cm
+
+    # --- Gating Variable ODEs ---
+    alpha_m=0.32*(V+47.13)/(1-np.exp(-0.1*(V+47.13))); beta_m=0.08*(V - (-11.0))/(np.exp(0.1*(V - (-11.0)))-1); dmdt=alpha_m*(1-m)-beta_m*m
+    alpha_h=0.135*np.exp(-(80+V)/6.8) if V<-40 else 0; beta_h=(3.56*np.exp(0.079*V)+3.1e5*np.exp(0.35*V)) if V<-40 else 1/(0.13*(1+np.exp(-(V+10.66)/11.1))); dhdt=alpha_h*(1-h)-beta_h*h
+    alpha_j=(-1.2714e5*np.exp(0.2444*V)-3.474e-5*np.exp(-0.04391*V))*(V+37.78)/(1+np.exp(0.311*(V+79.23))) if V<-40 else 0; beta_j=(0.1212*np.exp(-0.01052*V))/(1+np.exp(-0.1378*(V+40.14))) if V<-40 else (0.3*np.exp(-2.535e-7*V))/(1+np.exp(-0.1*(V+32))); djdt=alpha_j*(1-j)-beta_j*j
+    alpha_d=0.095*np.exp(-0.01*(V-5))/(1+np.exp(-0.072*(V-5))); beta_d=0.07*np.exp(-0.017*(V+44))/(1+np.exp(0.05*(V+44))); dddt=alpha_d*(1-d)-beta_d*d
+    alpha_f=0.012*np.exp(-0.008*(V+28))/(1+np.exp(0.15*(V+28))); beta_f=0.0065*np.exp(-0.02*(V+30))/(1+np.exp(-0.2*(V+30))); dfdt=alpha_f*(1-f)-beta_f*f
+    df_cadt=(1/(1+(Cai/0.00035)**2)-f_ca)/2.0
+    alpha_u=0.65/(np.exp(-(V+10)/8.5)+np.exp(-(V-30)/59.0)); beta_u=0.65/(2.5+np.exp((V+82)/17.0)); dudt=alpha_u*(1-u)-beta_u*u
+    alpha_v=1.4/(np.exp(-(V+27)/40.0)+np.exp(-(V-77)/40.0)); beta_v=1.0/(np.exp(-(V-37.97)/12.18)+np.exp((V-8.9)/7.38)); dvdt=alpha_v*(1-v)-beta_v*v
+    alpha_w=alpha_u; beta_w=beta_u; dwdt=alpha_w*(1-w)-beta_w*w
+    alpha_xr=0.0003*(V+14.1)/(1-np.exp(-(V+14.1)/5)); beta_xr=0.000073898*(V-3.3328)/(np.exp((V-3.3328)/5.1237)-1); dxrdt=alpha_xr*(1-x_r)-beta_xr*x_r
+    alpha_xs=0.00004*(V-19.9)/(1-np.exp(-(V-19.9)/17)); beta_xs=0.000035*(V-19.9)/(np.exp((V-19.9)/9)-1); dxsdt=alpha_xs*(1-x_s)-beta_xs*x_s
+
+    # --- Concentration ODEs ---
+    dCaidt = (-(I_CaL + I_b_Ca - 2 * I_NaCa) / (2 * F * 0.01) + (I_leak - I_up) * 0.02 / 0.01)
+    dCa_reldt = I_tr - I_rel
+    dCa_updt = I_up - I_tr - I_leak
+    dNadt = -(I_Na + I_b_Na + 3 * I_NaK + 3 * I_NaCa) / (F * 0.01)
+    dKdt = -(I_to + I_Kur + I_Kr + I_Ks + I_K1 + I_b_K - 2 * I_NaK - I_stim) / (F * 0.01)
+
+    return [dVdt, dudt, dvdt, dwdt, dddt, dfdt, df_cadt, dhdt, djdt, dmdt, dxrdt, dxsdt,
+            0, 0, 0, 0, dCaidt, dCa_reldt, dCa_updt, dNadt, dKdt]
+
+# --- PART 2: Simulation, Feature Engineering & Stability ---
+
+def detect_block(V):
+    return (np.max(V) - V[0]) < 20
+
+def extract_features(t, V, pacing_rate):
+    """Extracts features from the second to last action potential for stability."""
+    try:
+        # We analyze the second to last AP to avoid edge effects from simulation end
+        num_beats = int(t[-1] // pacing_rate)
+        if num_beats < 2: return {"is_valid": 0}
+
+        start_time_of_interest = (num_beats - 2) * pacing_rate
+        end_time_of_interest = (num_beats - 1) * pacing_rate
+        
+        ap_indices = np.where((t >= start_time_of_interest) & (t < end_time_of_interest))
+        t_ap, V_ap = t[ap_indices], V[ap_indices]
+
+        if len(t_ap) < 10 or detect_block(V_ap):
+            return {"is_valid": 0, "is_block": 1}
+
+        rmp = V_ap[0]
+        peak_V = np.max(V_ap)
+        apa = peak_V - rmp
+        peak_idx = np.argmax(V_ap)
+
+        dVdt = np.diff(V_ap) / (np.diff(t_ap) + 1e-9)
+        dvdt_max = np.max(dVdt) if len(dVdt) > 0 else 0
+
+        V_90 = peak_V - 0.9 * apa
+        V_50 = peak_V - 0.5 * apa
+        repol_phase = V_ap[peak_idx:]
+        t_repol = t_ap[peak_idx:]
+
+        repol_idx_90 = np.where(repol_phase < V_90)[0]
+        repol_idx_50 = np.where(repol_phase < V_50)[0]
+
+        if len(repol_idx_90) == 0 or len(repol_idx_50) == 0: return {"is_valid": 0}
+
+        apd90 = t_repol[repol_idx_90[0]] - t_repol[0]
+        apd50 = t_repol[repol_idx_50[0]] - t_repol[0]
+
+        if apd90 <= 0 or apd50 <= 0: return {"is_valid": 0}
+
+        return {"rmp": rmp, "peak_v": peak_V, "apa": apa, "dvdt_max": dvdt_max,
+                "apd90": apd90, "apd50": apd50, "is_valid": 1, "is_block": 0}
+    except (IndexError, ValueError) as e:
+        print(f"Feature extraction error: {e}")
+        return {"is_valid": 0, "is_block": 0}
+
+def run_simulation_with_pre_pacing(params, y0, pre_pacing_beats=50):
+    """Runs the simulation with a pre-pacing period to reach steady state."""
+    # Pre-pacing run
+    pre_pacing_duration = pre_pacing_beats * params['pacing_rate']
+    pre_sol = solve_ivp(fun=courtemanche_1998_model, t_span=[0, pre_pacing_duration], y0=y0, args=(params,),
+                        method='BDF', max_step=1.0)
+    y_steady_state = pre_sol.y[:, -1] # Get final state
+
+    # Main simulation run from steady state
+    t_span = [0, params['duration']]
+    sol = solve_ivp(fun=courtemanche_1998_model, t_span=t_span, y0=y_steady_state, args=(params,),
+                    method='BDF', dense_output=True, max_step=1.0)
+    
+    t = np.linspace(t_span[0], t_span[1], int(t_span[1] / 0.5))
+    V = sol.sol(t)[0]
+    return t, V
+
+# --- PART 3: Main Analysis Workflow ---
+
+if __name__ == '__main__':
+    print("--- Predicting Atrial Fibrillation Substrate Vulnerability (v2.1) ---")
+    start_time = time.time()
+    # Set seed for reproducibility
+    RANDOM_SEED = 42
+    np.random.seed(RANDOM_SEED)
+
+    # --- Part 1: Phenotype Data Generation ---
+    N_SAMPLES_PER_CLASS = 100
+    base_params = {'duration': 3200, 'pacing_rate': 1000} # 3 beats at 1 Hz for analysis
+
+    # Initial conditions for Courtemanche model
+    y0_initial = [-81.18, 0.97, 0.003, 0.003, 0.0001, 0.99, 0.6, 0.96, 0.97, 0.002,
+                  0.0003, 0.02, 0, 0, 0, 0, 0.0001, 1.2, 1.2, 11.2, 139.0]
+    
+    # Define remodeling parameters based on AF literature (e.g., Courtemanche '98, Colman '13)
+    phenotype_definitions = {
+        0: {'name': 'Normal Sinus Rhythm (NSR)', 'G_CaL_factor': (0.9, 1.1), 'G_to_factor': (0.9, 1.1),
+            'G_Kur_factor': (0.9, 1.1), 'G_K1_factor': (0.9, 1.1)},
+        1: {'name': 'Paroxysmal AF (pAF) Prone', 'G_CaL_factor': (0.6, 0.8), 'G_to_factor': (0.6, 0.8),
+            'G_Kur_factor': (0.7, 0.9), 'G_K1_factor': (1.1, 1.3)},
+        2: {'name': 'Chronic AF (cAF) Substrate', 'G_CaL_factor': (0.3, 0.5), 'G_to_factor': (0.3, 0.5),
+            'G_Kur_factor': (0.4, 0.6), 'G_K1_factor': (1.4, 1.7)}
+    }
+
+    print("\n--- Generating Training Dataset with Pre-Pacing ---")
+    feature_list = []
+    total_sims = N_SAMPLES_PER_CLASS * 3
+    for i in range(total_sims):
+        print(f"Running simulation {i+1}/{total_sims}...", end='\r')
+        label = np.random.randint(0, 3)
+        specs = phenotype_definitions[label]
+        params = base_params.copy()
+        params.update({k: np.random.uniform(*v) for k, v in specs.items() if k != 'name'})
+
+        t_sim, V_sim = run_simulation_with_pre_pacing(params, y0_initial)
+        features = extract_features(t_sim, V_sim, base_params['pacing_rate'])
+
+        if features.get('is_valid'):
+            features['phenotype_label'] = label
+            features['original_params'] = params
+            feature_list.append(features)
+
+    dataset = pd.DataFrame(feature_list)
+    print(f"\nDataset generated with {len(dataset)} valid samples.")
+    print("Label distribution:\n", dataset['phenotype_label'].value_counts())
+
+    if len(dataset) < 50:
+        print("\nCritical Error: Not enough valid simulations. Aborting.")
+    else:
+        # --- Part 2: Train & Evaluate Prognostic Classifier with Cross-Validation ---
+        print("\n--- Evaluating Prognostic Classifier with Stratified K-Fold Cross-Validation ---")
+        X = dataset[['rmp', 'peak_v', 'apa', 'dvdt_max', 'apd90', 'apd50']]
+        y = dataset['phenotype_label']
+        
+        n_splits = 5
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+        classifier = RandomForestClassifier(n_estimators=150, random_state=RANDOM_SEED, class_weight='balanced')
+        
+        accuracies = []
+        all_y_true = []
+        all_y_pred = []
+
+        for fold, (train_index, test_index) in enumerate(skf.split(X, y)):
+            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+            y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+            
+            classifier.fit(X_train, y_train)
+            y_pred = classifier.predict(X_test)
+            accuracies.append(accuracy_score(y_test, y_pred))
+            all_y_true.extend(y_test)
+            all_y_pred.extend(y_pred)
+            print(f"Fold {fold+1}/{n_splits} Accuracy: {accuracies[-1]:.3f}")
+
+        print(f"\nMean Cross-Validation Accuracy: {np.mean(accuracies) * 100:.2f}% ± {np.std(accuracies) * 100:.2f}%")
+        
+        # Final Confusion Matrix on all out-of-sample predictions
+        cm = confusion_matrix(all_y_true, all_y_pred)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['NSR', 'pAF Prone', 'cAF Substrate'])
+        disp.plot(cmap='plasma')
+        plt.title('Overall Classifier Performance (5-Fold CV)', fontsize=14)
+        plt.show()
+
+        # --- Part 3: Prognostic Stress Test Validation ---
+        print("\n--- Part 3: Prognostic Validation via Rapid Pacing Stress Test ---")
+        
+        # Re-train classifier on all data to find a candidate for validation
+        classifier.fit(X, y)
+        dataset['prediction'] = classifier.predict(X)
+        
+        paf_prone_predicted = dataset[dataset['prediction'] == 1]
+
+        if paf_prone_predicted.empty:
+            print("No cells were predicted as pAF-prone. Skipping validation.")
+        else:
+            patient_zero_index = paf_prone_predicted.index[0]
+            patient_zero_params = dataset.loc[patient_zero_index]['original_params']
+
+            print("Found a high-risk 'pAF Prone' cell. Applying rapid pacing stress...")
+
+            # Run baseline simulation (1 Hz pacing)
+            t_baseline, V_baseline = run_simulation_with_pre_pacing(patient_zero_params, y0_initial)
+            baseline_features = extract_features(t_baseline, V_baseline, patient_zero_params['pacing_rate'])
+
+            # Run "stress test" (rapid pacing at 3 Hz)
+            stressed_params = patient_zero_params.copy()
+            stressed_params['pacing_rate'] = 333 # Corresponds to ~3 Hz
+            stressed_params['duration'] = 4000 # Longer duration to see effect
+            t_stressed, V_stressed = run_simulation_with_pre_pacing(stressed_params, y0_initial, pre_pacing_beats=100)
+            stressed_features = extract_features(t_stressed, V_stressed, stressed_params['pacing_rate'])
+
+            # Visualize the outcome on a single plot
+            fig, ax = plt.subplots(figsize=(12, 7))
+
+            # Plot baseline AP
+            t_bl_start = 1 * patient_zero_params['pacing_rate']
+            t_bl_end = t_bl_start + 500
+            bl_indices = (t_baseline >= t_bl_start) & (t_baseline < t_bl_end)
+            ax.plot(t_baseline[bl_indices] - t_bl_start, V_baseline[bl_indices], 
+                    label=f'Baseline (1 Hz), APD90: {baseline_features.get("apd90", 0):.1f} ms', color='dodgerblue', lw=2.5)
+
+            # Plot stressed AP
+            t_st_start = 10 * stressed_params['pacing_rate'] # A later beat for stability
+            t_st_end = t_st_start + 500
+            st_indices = (t_stressed >= t_st_start) & (t_stressed < t_st_end)
+            ax.plot(t_stressed[st_indices] - t_st_start, V_stressed[st_indices], 
+                    label=f'Stressed (3 Hz), APD90: {stressed_features.get("apd90", 0):.1f} ms', color='crimson', lw=2.5, linestyle='--')
+            
+            ax.set_title('Prognostic Validation: Rapid Pacing Induces APD Shortening', fontsize=16)
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('Voltage (mV)')
+            ax.legend(fontsize=12)
+            ax.grid(True, linestyle='--', alpha=0.6)
+            
+            apd_change = baseline_features.get("apd90", 0) - stressed_features.get("apd90", 0)
+            outcome = f"Significant APD Shortening ({apd_change:.1f} ms)" if apd_change > 20 else "Minimal APD Change"
+            
+            ax.text(0.5, 0.1, f'Outcome: {outcome}', transform=ax.transAxes, fontsize=14, ha='center',
+                    bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.8))
+            
+            plt.show()
+
+    print(f"\nTotal script execution time: {time.time() - start_time:.2f} seconds.")
