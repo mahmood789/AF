@@ -134,7 +134,17 @@ def courtemanche_1998_model(t, y, params):
 # --- PART 2: Simulation, Feature Engineering & Stability ---
 
 def detect_block(V):
-    return (np.max(V) - V[0]) < 20
+    # Action potential amplitude should be significantly larger than resting potential
+    # A block might be indicated if the peak voltage is not much higher than the initial voltage
+    # Let's consider a block if the peak is less than 50mV above the starting voltage of the AP
+    if len(V) > 0:
+        peak_V = np.max(V)
+        start_V = V[0]
+        if peak_V - start_V < 50:
+            print(f"Potential block detected. Peak_V: {peak_V:.2f}, Start_V: {start_V:.2f}")
+            return True
+    return False
+
 
 def extract_features(t, V, pacing_rate):
     """Extracts features from the second to last action potential for stability."""
@@ -145,11 +155,13 @@ def extract_features(t, V, pacing_rate):
 
         start_time_of_interest = (num_beats - 2) * pacing_rate
         end_time_of_interest = (num_beats - 1) * pacing_rate
-        
+
         ap_indices = np.where((t >= start_time_of_interest) & (t < end_time_of_interest))
         t_ap, V_ap = t[ap_indices], V[ap_indices]
 
         if len(t_ap) < 10 or detect_block(V_ap):
+            if detect_block(V_ap):
+                 print(f"Block detected for V_ap: {V_ap[:10]}...") # Print first 10 values of V_ap
             return {"is_valid": 0, "is_block": 1}
 
         rmp = V_ap[0]
@@ -193,7 +205,7 @@ def run_simulation_with_pre_pacing(params, y0, pre_pacing_beats=50):
     t_span = [0, params['duration']]
     sol = solve_ivp(fun=courtemanche_1998_model, t_span=t_span, y0=y_steady_state, args=(params,),
                     method='BDF', dense_output=True, max_step=1.0)
-    
+
     t = np.linspace(t_span[0], t_span[1], int(t_span[1] / 0.5))
     V = sol.sol(t)[0]
     return t, V
@@ -214,7 +226,7 @@ if __name__ == '__main__':
     # Initial conditions for Courtemanche model
     y0_initial = [-81.18, 0.97, 0.003, 0.003, 0.0001, 0.99, 0.6, 0.96, 0.97, 0.002,
                   0.0003, 0.02, 0, 0, 0, 0, 0.0001, 1.2, 1.2, 11.2, 139.0]
-    
+
     # Define remodeling parameters based on AF literature (e.g., Courtemanche '98, Colman '13)
     phenotype_definitions = {
         0: {'name': 'Normal Sinus Rhythm (NSR)', 'G_CaL_factor': (0.9, 1.1), 'G_to_factor': (0.9, 1.1),
@@ -254,11 +266,11 @@ if __name__ == '__main__':
         print("\n--- Evaluating Prognostic Classifier with Stratified K-Fold Cross-Validation ---")
         X = dataset[['rmp', 'peak_v', 'apa', 'dvdt_max', 'apd90', 'apd50']]
         y = dataset['phenotype_label']
-        
+
         n_splits = 5
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
         classifier = RandomForestClassifier(n_estimators=150, random_state=RANDOM_SEED, class_weight='balanced')
-        
+
         accuracies = []
         all_y_true = []
         all_y_pred = []
@@ -266,7 +278,7 @@ if __name__ == '__main__':
         for fold, (train_index, test_index) in enumerate(skf.split(X, y)):
             X_train, X_test = X.iloc[train_index], X.iloc[test_index]
             y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-            
+
             classifier.fit(X_train, y_train)
             y_pred = classifier.predict(X_test)
             accuracies.append(accuracy_score(y_test, y_pred))
@@ -275,7 +287,7 @@ if __name__ == '__main__':
             print(f"Fold {fold+1}/{n_splits} Accuracy: {accuracies[-1]:.3f}")
 
         print(f"\nMean Cross-Validation Accuracy: {np.mean(accuracies) * 100:.2f}% ± {np.std(accuracies) * 100:.2f}%")
-        
+
         # Final Confusion Matrix on all out-of-sample predictions
         cm = confusion_matrix(all_y_true, all_y_pred)
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['NSR', 'pAF Prone', 'cAF Substrate'])
@@ -285,11 +297,11 @@ if __name__ == '__main__':
 
         # --- Part 3: Prognostic Stress Test Validation ---
         print("\n--- Part 3: Prognostic Validation via Rapid Pacing Stress Test ---")
-        
+
         # Re-train classifier on all data to find a candidate for validation
         classifier.fit(X, y)
         dataset['prediction'] = classifier.predict(X)
-        
+
         paf_prone_predicted = dataset[dataset['prediction'] == 1]
 
         if paf_prone_predicted.empty:
@@ -318,28 +330,28 @@ if __name__ == '__main__':
             t_bl_start = 1 * patient_zero_params['pacing_rate']
             t_bl_end = t_bl_start + 500
             bl_indices = (t_baseline >= t_bl_start) & (t_baseline < t_bl_end)
-            ax.plot(t_baseline[bl_indices] - t_bl_start, V_baseline[bl_indices], 
+            ax.plot(t_baseline[bl_indices] - t_bl_start, V_baseline[bl_indices],
                     label=f'Baseline (1 Hz), APD90: {baseline_features.get("apd90", 0):.1f} ms', color='dodgerblue', lw=2.5)
 
             # Plot stressed AP
             t_st_start = 10 * stressed_params['pacing_rate'] # A later beat for stability
             t_st_end = t_st_start + 500
             st_indices = (t_stressed >= t_st_start) & (t_stressed < t_st_end)
-            ax.plot(t_stressed[st_indices] - t_st_start, V_stressed[st_indices], 
+            ax.plot(t_stressed[st_indices] - t_st_start, V_stressed[st_indices],
                     label=f'Stressed (3 Hz), APD90: {stressed_features.get("apd90", 0):.1f} ms', color='crimson', lw=2.5, linestyle='--')
-            
+
             ax.set_title('Prognostic Validation: Rapid Pacing Induces APD Shortening', fontsize=16)
             ax.set_xlabel('Time (ms)')
             ax.set_ylabel('Voltage (mV)')
             ax.legend(fontsize=12)
             ax.grid(True, linestyle='--', alpha=0.6)
-            
+
             apd_change = baseline_features.get("apd90", 0) - stressed_features.get("apd90", 0)
             outcome = f"Significant APD Shortening ({apd_change:.1f} ms)" if apd_change > 20 else "Minimal APD Change"
-            
+
             ax.text(0.5, 0.1, f'Outcome: {outcome}', transform=ax.transAxes, fontsize=14, ha='center',
                     bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.8))
-            
+
             plt.show()
 
     print(f"\nTotal script execution time: {time.time() - start_time:.2f} seconds.")
